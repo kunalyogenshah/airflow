@@ -445,6 +445,10 @@ DagParsingStat = namedtuple('DagParsingStat',
                             ['file_paths', 'all_pids', 'done',
                              'all_files_processed', 'result_count'])
 
+TaskFailureId = namedtuple('TaskFailureId',
+                           ['dag_id', 'task_id', 'execution_date',
+                            'try_number'])
+
 
 class DagParsingSignal(enum.Enum):
     AGENT_HEARTBEAT = 'agent_heartbeat'
@@ -466,6 +470,7 @@ class DagFileProcessorAgent(LoggingMixin):
                  file_paths,
                  max_runs,
                  processor_factory,
+                 executor,
                  async_mode):
         """
         :param dag_directory: Directory where DAG definitions are kept. All
@@ -479,6 +484,8 @@ class DagFileProcessorAgent(LoggingMixin):
         :param processor_factory: function that creates processors for DAG
             definition files. Arguments are (dag_definition_path, log_file_path)
         :type processor_factory: (unicode, unicode, list) -> (AbstractDagFileProcessor)
+        :param executor: executor instance that is running the tasks.
+        :type executor: BaseExecutor if agent handles executor events.
         :param async_mode: Whether to start agent in async mode
         :type async_mode: bool
         """
@@ -504,6 +511,12 @@ class DagFileProcessorAgent(LoggingMixin):
         self._manager = multiprocessing.Manager()
         self._stat_queue = self._manager.Queue()
         self._result_queue = self._manager.Queue()
+
+        # If agent handles executor events, then we need to provide the
+        # executor instance here.
+        self._executor = executor
+        # Used to pass failed TIs to manager.
+        self._failed_ti_queue = self._manager.Queue()
         self._process = None
         self._done = False
         # Initialized as true so we do not deactivate w/o any actual DAG parsing.
@@ -521,6 +534,7 @@ class DagFileProcessorAgent(LoggingMixin):
                                              self._child_signal_conn,
                                              self._stat_queue,
                                              self._result_queue,
+                                             self._failed_ti_queue,
                                              self._async_mode)
         self.log.info("Launched DagFileProcessorManager with pid: %s", self._process.pid)
 
@@ -548,6 +562,7 @@ class DagFileProcessorAgent(LoggingMixin):
                         signal_conn,
                         _stat_queue,
                         result_queue,
+                        failed_ti_queue,
                         async_mode):
         def helper():
             # Reload configurations and settings to avoid collision with parent process.
@@ -568,6 +583,7 @@ class DagFileProcessorAgent(LoggingMixin):
                                                         signal_conn,
                                                         _stat_queue,
                                                         result_queue,
+                                                        failed_ti_queue,
                                                         async_mode)
 
             processor_manager.start()
@@ -600,6 +616,8 @@ class DagFileProcessorAgent(LoggingMixin):
             except Empty:
                 break
 
+        # TODO(kunal) : Process executor events, determine failure, and
+        # add to failed_ti_queue.
         self._result_count = 0
 
         return simple_dags
@@ -708,6 +726,7 @@ class DagFileProcessorManager(LoggingMixin):
                  signal_conn,
                  stat_queue,
                  result_queue,
+                 failed_ti_queue,
                  async_mode=True):
         """
         :param dag_directory: Directory where DAG definitions are kept. All
@@ -727,6 +746,8 @@ class DagFileProcessorManager(LoggingMixin):
         :type stat_queue: multiprocessing.Queue
         :param result_queue: the queue to use for passing back the result to agent.
         :type result_queue: multiprocessing.Queue
+        :param failed_ti_queue: the queue to use for reading in failed TIs from the agent.
+        :type failed_ti_queue: multiprocessing.Queue
         :param async_mode: whether to start the manager in async mode
         :type async_mode: bool
         """
@@ -738,6 +759,8 @@ class DagFileProcessorManager(LoggingMixin):
         self._signal_conn = signal_conn
         self._stat_queue = stat_queue
         self._result_queue = result_queue
+        self._failed_ti_queue = failed_ti_queue
+        self._failed_tis = {}
         self._async_mode = async_mode
 
         self._parallelism = conf.getint('scheduler', 'max_threads')
@@ -779,7 +802,6 @@ class DagFileProcessorManager(LoggingMixin):
                                                  'dag_dir_list_interval')
 
         self._log = logging.getLogger('airflow.processor_manager')
-
         signal.signal(signal.SIGINT, self._exit_gracefully)
         signal.signal(signal.SIGTERM, self._exit_gracefully)
 
@@ -820,6 +842,16 @@ class DagFileProcessorManager(LoggingMixin):
         """
         while True:
             loop_start_time = time.time()
+
+            while True:
+                try:
+                    ghost = self.failed_ti_queue.get(block=False)
+                    key = TaskFailureId(ghost.dag_id, ghost.task_id,
+                                        ghost.execution_date, ghost.try_number)
+                    self._failed_tis[key] = ghost
+                except:
+                    # No more ghosts left for now.
+                    break
 
             if self._signal_conn.poll():
                 agent_signal = self._signal_conn.recv()
@@ -1213,13 +1245,14 @@ class DagFileProcessorManager(LoggingMixin):
 
             self._file_path_queue.extend(files_paths_to_queue)
 
+        # TODO(kunal) : Change this function to also update failed_tis
         zombies = self._find_zombies()
 
         # Start more processors if we have enough slots and files to process
         while (self._parallelism - len(self._processors) > 0 and
                len(self._file_path_queue) > 0):
             file_path = self._file_path_queue.pop(0)
-            processor = self._processor_factory(file_path, zombies)
+            processor = self._processor_factory(file_path, zombies, self._failed_tis)
 
             processor.start()
             self.log.debug(
